@@ -641,12 +641,19 @@ class WorkflowAgent:
            - Do motivations help understand the "why" behind each action?
            - Are there steps where motivation seems unclear or insufficient?
         
-        4. WORKFLOW GENERALIZABILITY:
+        4. REPETITIVE PATTERN ANALYSIS:
+           - Identify groups of steps that represent repetitive actions or patterns
+           - Determine if repetitive steps can be generalized into reusable patterns
+           - Assess whether multiple similar steps should be consolidated or represented as loops/iterations
+           - Look for opportunities to express "repeat N times" or "for each item" patterns
+        
+        5. WORKFLOW GENERALIZABILITY:
            - Could this workflow documentation be applied to similar processes?
            - Are the descriptions domain-specific or appropriately general?
            - What patterns emerge that could apply to other workflows?
+           - How can repetitive sequences be made more reusable?
         
-        5. DOCUMENTATION QUALITY:
+        6. DOCUMENTATION QUALITY:
            - What would make this workflow more useful as documentation?
            - Where would additional context significantly improve understanding?
            - What questions would someone following this workflow likely have?
@@ -663,25 +670,41 @@ class WorkflowAgent:
                 "apparent_gaps": ["list of potential missing steps"],
                 "objective_clarity": "how clear the overall goal is"
             }},
+            "repetitive_patterns": {{
+                "identified_patterns": [
+                    {{
+                        "pattern_name": "descriptive name for the pattern",
+                        "step_numbers": [1, 2, 3],
+                        "pattern_description": "what this repetitive sequence accomplishes",
+                        "generalization_opportunity": "how this could be expressed more efficiently",
+                        "consolidation_suggestion": "specific recommendation for improving this pattern"
+                    }}
+                ],
+                "consolidation_recommendations": ["specific suggestions for reducing repetition"],
+                "pattern_generalization": "overall approach to make repetitive steps more reusable"
+            }},
             "quality_issues": {{
                 "unclear_actions": ["step numbers with unclear actions"],
                 "weak_motivations": ["step numbers with insufficient motivation"],
                 "inconsistent_formatting": ["formatting issues found"],
-                "missing_context": ["areas needing more context"]
+                "missing_context": ["areas needing more context"],
+                "excessive_repetition": ["step numbers that are unnecessarily repetitive"]
             }},
             "improvement_opportunities": {{
                 "critical_gaps": ["most important missing information"],
                 "enhancement_areas": ["areas that would benefit from clarification"],
-                "generalization_needs": ["aspects that are too specific"]
+                "generalization_needs": ["aspects that are too specific"],
+                "pattern_consolidation": ["opportunities to consolidate repetitive steps"]
             }},
             "suggested_questions": {{
                 "motivation_clarifications": ["questions about unclear motivations"],
                 "process_questions": ["questions about workflow logic"],
-                "context_questions": ["questions about missing context"]
+                "context_questions": ["questions about missing context"],
+                "pattern_questions": ["questions about repetitive patterns and their variations"]
             }}
         }}
         
-        Be thorough but practical in your assessment. Focus on actionable improvements.
+        Be thorough but practical in your assessment. Focus on actionable improvements and identify opportunities to generalize repetitive patterns.
         """
         
         try:
@@ -820,8 +843,21 @@ class WorkflowAgent:
         2. Adding missing context to actions
         3. Improving the overall flow description
         4. Filling in any logical gaps
+        5. IDENTIFYING AND CONSOLIDATING REPETITIVE PATTERNS:
+           - Look for steps that represent repetitive actions (e.g., multiple "add contact to spreadsheet" steps)
+           - Consolidate repetitive steps into generalized patterns where appropriate
+           - Use loop-like descriptions (e.g., "Repeat for each contact: Add contact details to spreadsheet")
+           - Preserve unique variations while generalizing common patterns
+           - Create more reusable workflow documentation
         
-        Return the enhanced workflow in the same JSON format but with improved descriptions.
+        ENHANCEMENT GUIDELINES FOR REPETITIVE PATTERNS:
+        - If 3+ similar steps exist, consider consolidating into a pattern
+        - Maintain the essential information while reducing redundancy
+        - Use language like "For each [item]:", "Repeat until:", "Iterate through:"
+        - Preserve any unique aspects or variations in the repetitive steps
+        - Focus on making the workflow more actionable and reusable
+        
+        Return the enhanced workflow in the same JSON format but with improved descriptions and consolidated repetitive patterns where applicable.
         """
         
         try:
