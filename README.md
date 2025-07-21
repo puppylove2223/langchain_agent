@@ -44,14 +44,22 @@ OPENAI_API_KEY=your_openai_api_key_here
 LANGCHAIN_API_KEY=your_langchain_api_key_here
 ```
 
-### 3. Run the Workflow Agent
+### 3. Run the Unified Workflow Agent
 
 ```bash
 python workflow_agent.py
 ```
 
-### 4. Enhance Captured Workflows
+The agent now runs both capture and enhancement phases in a single unified workflow:
+- **Capture Phase**: Screenshots every 10 seconds with LLM analysis
+- **Enhancement Phase**: Comprehensive workflow refinement (triggered by Ctrl+R)
 
+**Keyboard Controls:**
+- `Ctrl+R`: Transition from capture to enhancement phase
+- `Ctrl+Shift+Q`: Stop workflow gracefully  
+- `Ctrl+C`: Emergency stop
+
+**Note**: For post-processing existing sessions, you can still use:
 ```bash
 python enhanced_analyzer.py
 ```
@@ -90,12 +98,19 @@ The agent automatically identifies and adapts to different workflow types:
 ### LangGraph Workflow Structure
 
 ```
-[Capture] → [Contextual Analysis] → [Clarification Assessment] → [Human Input?] → [Continue?]
-    ↑              ↓                        ↓                        ↓           ↓
-    ←──────────[Continue]────────────────────────────────────────────────────────
-                                                                    ↓
-                                                                  [END]
+CAPTURE PHASE:
+[Capture] → [Analysis] → [Human Input?] → [Check Status] → [Continue/Enhance?]
+    ↑          ↓              ↓              ↓                ↓
+    ←──────────────────────────────────────[Continue]       [Ctrl+R]
+                                                              ↓
+ENHANCEMENT PHASE:                                            ↓
+[Enhancement Analysis] → [Refinement Questions?] → [Enhanced Results] → [END]
 ```
+
+**Phase Transitions:**
+- **Ctrl+R**: Switch from capture to enhancement phase
+- **Ctrl+Shift+Q**: End workflow at any time
+- **Automatic**: Enhancement runs comprehensive analysis and optional refinement
 
 ### Session Structure
 
@@ -121,13 +136,14 @@ sessions/
 - Contextually integrates human feedback
 - Automatically infers workflow types and patterns
 
-### WorkflowEnhancer (`enhanced_analyzer.py`)
+### Enhancement Phase (Integrated)
 
-**LLM-Driven Refinement Tool** that:
+**LLM-Driven Refinement System** that:
 - Performs comprehensive workflow analysis using LLM evaluation frameworks
 - Generates contextual refinement questions based on workflow type and issues
 - Provides workflow generalizability assessment
 - Creates domain-specific improvement suggestions
+- **Triggered by Ctrl+R** during capture phase for seamless transition
 
 ### Contextual Data Models
 

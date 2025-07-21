@@ -6,6 +6,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, TypedDict, Annotated
+import threading
 
 import pyautogui
 from PIL import Image
@@ -15,13 +16,19 @@ from langchain_core.messages import HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langgraph.checkpoint.memory import MemorySaver
 
 from dotenv import load_dotenv
 import os
 
 # Load environment variables
 load_dotenv()
+
+# Global control variables
+workflow_control = {
+    "transition_to_enhancement": False,
+    "stop_workflow": False,
+    "force_human_input": False
+}
 
 class WorkflowStep(BaseModel):
     step_number: int
@@ -41,9 +48,17 @@ class WorkflowState(TypedDict):
     needs_human_input: bool
     human_question: str
     continue_workflow: bool
+    phase: str  # "capture" or "enhancement"
+    enhancement_complete: bool
 
 class WorkflowAgent:
-    def __init__(self):
+    def __init__(self, human_interaction_level: str = "balanced"):
+        """
+        Initialize WorkflowAgent
+        
+        Args:
+            human_interaction_level: "conservative", "balanced", or "frequent"
+        """
         self.llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0.1,
@@ -51,7 +66,67 @@ class WorkflowAgent:
         )
         self.session_folder = Path("sessions")
         self.session_folder.mkdir(exist_ok=True)
+        self.keyboard_listener = None
+        self.human_interaction_level = human_interaction_level
+        self._setup_keyboard_listener()
     
+    def _setup_keyboard_listener(self):
+        """Setup global keyboard listener for Ctrl+R and Ctrl+C"""
+        try:
+            from pynput import keyboard
+            
+            def on_key_combination():
+                """Handle Ctrl+R combination"""
+                print("\n🔄 Ctrl+R detected - Transitioning to enhancement phase...")
+                workflow_control["transition_to_enhancement"] = True
+            
+            def on_stop_combination():
+                """Handle Ctrl+Shift+Q combination to stop"""
+                print("\n⏹️ Ctrl+Shift+Q detected - Stopping workflow...")
+                workflow_control["stop_workflow"] = True
+            
+            def on_manual_question():
+                """Handle Ctrl+H to manually trigger human input"""
+                print("\n❓ Ctrl+H detected - Will ask for clarification on next step...")
+                workflow_control["force_human_input"] = True
+            
+            # Set up hotkey combinations
+            ctrl_r = keyboard.HotKey(keyboard.HotKey.parse('<ctrl>+r'), on_key_combination)
+            ctrl_shift_q = keyboard.HotKey(keyboard.HotKey.parse('<ctrl>+<shift>+q'), on_stop_combination)
+            ctrl_h = keyboard.HotKey(keyboard.HotKey.parse('<ctrl>+h'), on_manual_question)
+            
+            def for_canonical(f):
+                return lambda k: f(self.keyboard_listener.canonical(k))
+            
+            hotkeys = [ctrl_r, ctrl_shift_q, ctrl_h]
+            
+            def on_press(key):
+                for hotkey in hotkeys:
+                    hotkey.press(self.keyboard_listener.canonical(key))
+            
+            def on_release(key):
+                for hotkey in hotkeys:
+                    hotkey.release(self.keyboard_listener.canonical(key))
+            
+            self.keyboard_listener = keyboard.Listener(
+                on_press=on_press,
+                on_release=on_release
+            )
+            self.keyboard_listener.start()
+            
+            print("⌨️  Keyboard shortcuts activated:")
+            print("   Ctrl+R: Transition to enhancement phase")  
+            print("   Ctrl+H: Force human input question on next step")
+            print("   Ctrl+Shift+Q: Stop workflow")
+            print("   Ctrl+C: Emergency stop")
+            
+        except ImportError:
+            print("⚠️  pynput not available. Install with: pip install pynput")
+            print("   Falling back to Ctrl+C only for stopping")
+        except Exception as e:
+            print(f"⚠️  Could not setup keyboard listener: {e}")
+            print("   Falling back to Ctrl+C only for stopping")
+
     def _extract_json_from_response(self, response_content: str) -> str:
         """Extract JSON from LLM response, handling markdown code blocks"""
         response_text = response_content.strip()
@@ -138,6 +213,24 @@ class WorkflowAgent:
             response_text = self._extract_json_from_response(response.content)
             basic_analysis = json.loads(response_text)
             
+            # Check for manual trigger first
+            if workflow_control["force_human_input"]:
+                workflow_control["force_human_input"] = False  # Reset flag
+                return {
+                    "action": basic_analysis["action"],
+                    "motivation": basic_analysis["motivation"],
+                    "ui_elements": basic_analysis["ui_elements"],
+                    "confidence_score": self._certainty_to_score(basic_analysis["certainty_level"]),
+                    "needs_clarification": True,
+                    "clarification_question": f"[Manual trigger] Can you provide more context about this step: {basic_analysis['action']}? What was your specific motivation?",
+                    "workflow_progression": basic_analysis.get("workflow_progression", ""),
+                    "analysis_notes": basic_analysis.get("analysis_notes", ""),
+                    "clarification_focus": "motivation"
+                }
+            
+            # Get interaction guidelines based on level
+            interaction_guidelines = self._get_interaction_guidelines()
+            
             # Second pass: Determine if clarification is needed
             clarification_prompt = f"""
             Review this workflow step analysis and determine if human clarification would improve understanding:
@@ -162,8 +255,7 @@ class WorkflowAgent:
                 "clarification_focus": "What aspect needs clarification: motivation|action|context|purpose"
             }}
             
-            Only request clarification if it would genuinely improve workflow understanding.
-            Be conservative - prefer reasonable assumptions over interrupting the user.
+            {interaction_guidelines}
             """
             
             clarification_response = self.llm.invoke([HumanMessage(content=clarification_prompt)])
@@ -248,6 +340,34 @@ class WorkflowAgent:
             "low": 0.4
         }
         return mapping.get(certainty_level.lower(), 0.5)
+    
+    def _get_interaction_guidelines(self) -> str:
+        """Get guidelines for human interaction based on configured level"""
+        guidelines = {
+            "conservative": """
+            Only request clarification if it would genuinely improve workflow understanding.
+            Be conservative - prefer reasonable assumptions over interrupting the user.
+            """,
+            "balanced": """
+            Request clarification when:
+            - Multiple reasonable interpretations exist
+            - The motivation could be clearer for documentation purposes  
+            - Context would significantly help future users understand the workflow
+            - The action appears complex or non-obvious
+            
+            Balance thoroughness with user experience - err slightly toward asking questions for better documentation.
+            """,
+            "frequent": """
+            Request clarification more actively to create comprehensive documentation:
+            - When any aspect could benefit from additional context
+            - To ensure motivations are clearly documented
+            - When steps might be unclear to future users
+            - To capture domain-specific knowledge
+            
+            Prioritize thorough documentation over minimal interruption.
+            """
+        }
+        return guidelines.get(self.human_interaction_level, guidelines["balanced"])
 
     def _generate_error_response(self, error: Exception, context: str) -> Dict:
         """Generate contextual error response using LLM"""
@@ -472,9 +592,277 @@ class WorkflowAgent:
         except:
             return "USER_PERFORMED_ACTION"
 
+    def enhancement_analysis_node(self, state: WorkflowState) -> WorkflowState:
+        """Node: Analyze workflow completeness using comprehensive LLM evaluation"""
+        print("🔍 Analyzing workflow completeness...")
+        
+        # Load workflow data
+        workflow_data = {
+            "session_id": state["session_id"],
+            "created_at": datetime.now().isoformat(),
+            "steps": [step.model_dump() for step in state["steps"]]
+        }
+        
+        steps = state["steps"]
+        session_metadata = {
+            "session_id": state["session_id"],
+            "total_steps": len(steps)
+        }
+        
+        if not steps:
+            print("❌ No workflow steps found")
+            state["enhancement_complete"] = True
+            return state
+        
+        # Multi-phase LLM analysis for comprehensive evaluation
+        analysis_prompt = f"""
+        You are a workflow documentation expert analyzing a captured workflow for completeness and clarity.
+        
+        SESSION METADATA:
+        {json.dumps(session_metadata, indent=2)}
+        
+        WORKFLOW STEPS:
+        {json.dumps([step.model_dump() for step in steps], indent=2)}
+        
+        COMPREHENSIVE EVALUATION FRAMEWORK:
+        
+        1. WORKFLOW COHERENCE:
+           - Does the sequence of steps form a logical, complete process?
+           - Are there apparent gaps or missing steps in the workflow?
+           - Do the steps build toward a clear objective?
+        
+        2. ACTION CLARITY:
+           - Are action descriptions sufficiently general yet descriptive?
+           - Can actions be understood without seeing the screenshots?
+           - Are actions consistently formatted and categorized?
+        
+        3. MOTIVATION DEPTH:
+           - Are motivations clearly explained and contextually appropriate?
+           - Do motivations help understand the "why" behind each action?
+           - Are there steps where motivation seems unclear or insufficient?
+        
+        4. WORKFLOW GENERALIZABILITY:
+           - Could this workflow documentation be applied to similar processes?
+           - Are the descriptions domain-specific or appropriately general?
+           - What patterns emerge that could apply to other workflows?
+        
+        5. DOCUMENTATION QUALITY:
+           - What would make this workflow more useful as documentation?
+           - Where would additional context significantly improve understanding?
+           - What questions would someone following this workflow likely have?
+        
+        Provide a thorough analysis in JSON format:
+        {{
+            "overall_assessment": "comprehensive evaluation summary",
+            "is_complete": true/false,
+            "clarity_score": 0.0-1.0,
+            "analysis_confidence": "high|medium|low",
+            "workflow_type": "inferred type of workflow",
+            "coherence_analysis": {{
+                "logical_flow": "assessment of step sequence",
+                "apparent_gaps": ["list of potential missing steps"],
+                "objective_clarity": "how clear the overall goal is"
+            }},
+            "quality_issues": {{
+                "unclear_actions": ["step numbers with unclear actions"],
+                "weak_motivations": ["step numbers with insufficient motivation"],
+                "inconsistent_formatting": ["formatting issues found"],
+                "missing_context": ["areas needing more context"]
+            }},
+            "improvement_opportunities": {{
+                "critical_gaps": ["most important missing information"],
+                "enhancement_areas": ["areas that would benefit from clarification"],
+                "generalization_needs": ["aspects that are too specific"]
+            }},
+            "suggested_questions": {{
+                "motivation_clarifications": ["questions about unclear motivations"],
+                "process_questions": ["questions about workflow logic"],
+                "context_questions": ["questions about missing context"]
+            }}
+        }}
+        
+        Be thorough but practical in your assessment. Focus on actionable improvements.
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
+            response_text = self._extract_json_from_response(response.content)
+            analysis = json.loads(response_text)
+            
+            print(f"📈 Analysis Results:")
+            print(f"Complete: {analysis.get('is_complete', False)}")
+            print(f"Clarity Score: {analysis.get('clarity_score', 0):.1f}/1.0")
+            print(f"Workflow Type: {analysis.get('workflow_type', 'unknown')}")
+            
+            # Store analysis in state for potential refinement
+            state["enhancement_analysis"] = analysis
+            
+            # Check if refinement questions needed
+            quality_issues = analysis.get("quality_issues", {})
+            has_issues = any(quality_issues.values())
+            
+            if has_issues:
+                state["needs_human_input"] = True
+                state["human_question"] = "enhancement_refinement"
+            else:
+                state["enhancement_complete"] = True
+                print("✅ Workflow analysis complete - no major issues found")
+            
+        except Exception as e:
+            print(f"Error analyzing workflow: {e}")
+            state["enhancement_complete"] = True
+            
+        return state
+
+    def enhancement_refinement_node(self, state: WorkflowState) -> WorkflowState:
+        """Node: Generate and handle refinement questions"""
+        if not state.get("needs_human_input") or state.get("human_question") != "enhancement_refinement":
+            return state
+            
+        analysis = state.get("enhancement_analysis", {})
+        
+        # Generate contextual refinement questions
+        print("\n❓ Generating refinement questions...")
+        
+        workflow_type = analysis.get("workflow_type", "unknown workflow")
+        steps = state["steps"]
+        
+        question_generation_prompt = f"""
+        You are helping to refine workflow documentation by generating targeted questions.
+        
+        WORKFLOW CONTEXT:
+        - Type: {workflow_type}
+        - Total Steps: {len(steps)}
+        - Completeness: {"Complete" if analysis.get("is_complete") else "Incomplete"}
+        - Clarity Score: {analysis.get("clarity_score", 0):.1f}/1.0
+        
+        ANALYSIS FINDINGS:
+        {json.dumps(analysis, indent=2)}
+        
+        TASK: Generate 3-5 specific questions that would most improve this workflow documentation.
+        
+        QUESTION GENERATION PRINCIPLES:
+        1. Focus on the most impactful gaps or unclear areas
+        2. Ask questions that would help generalize the workflow for reuse
+        3. Prioritize understanding motivations over specific details
+        4. Consider the workflow type and typical challenges in that domain
+        
+        Generate prioritized questions in JSON format:
+        {{
+            "priority_questions": [
+                "Question 1 text",
+                "Question 2 text", 
+                "Question 3 text"
+            ],
+            "question_strategy": "Overall approach for refinement"
+        }}
+        
+        Make questions conversational and specific to this workflow context.
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=question_generation_prompt)])
+            response_text = self._extract_json_from_response(response.content)
+            question_data = json.loads(response_text)
+            
+            questions = question_data.get("priority_questions", [])
+            
+            if questions:
+                print(f"\n🎯 Refinement Questions ({len(questions)}):")
+                responses = []
+                
+                for i, question in enumerate(questions, 1):
+                    print(f"\n{i}. {question}")
+                    response = input("Your answer (or press Enter to skip): ").strip()
+                    if response:
+                        responses.append(response)
+                
+                if responses:
+                    # Enhance workflow with responses
+                    combined_context = "\n".join([f"Q: {q}\nA: {r}" for q, r in zip(questions, responses) if r])
+                    enhanced_workflow = self._enhance_workflow_with_context(state, combined_context)
+                    
+                    # Save enhanced workflow
+                    enhanced_file = self.session_folder / state["session_id"] / "workflow_enhanced.json"
+                    with open(enhanced_file, 'w') as f:
+                        json.dump(enhanced_workflow, f, indent=2)
+                    
+                    print(f"\n✅ Enhanced workflow saved: {enhanced_file}")
+                else:
+                    print("\n⏭️  No responses provided - skipping enhancement")
+            
+        except Exception as e:
+            print(f"Error generating refinement questions: {e}")
+        
+        state["needs_human_input"] = False
+        state["enhancement_complete"] = True
+        return state
+
+    def _enhance_workflow_with_context(self, state: WorkflowState, additional_context: str) -> Dict:
+        """Enhance workflow with additional user-provided context"""
+        workflow_data = {
+            "session_id": state["session_id"],
+            "created_at": datetime.now().isoformat(),
+            "steps": [step.model_dump() for step in state["steps"]]
+        }
+        
+        steps = [step.model_dump() for step in state["steps"]]
+        
+        enhancement_prompt = f"""
+        Original workflow steps:
+        {json.dumps(steps, indent=2)}
+        
+        Additional context provided by user:
+        {additional_context}
+        
+        Based on this additional context, enhance the workflow by:
+        1. Updating motivations where they were unclear
+        2. Adding missing context to actions
+        3. Improving the overall flow description
+        4. Filling in any logical gaps
+        
+        Return the enhanced workflow in the same JSON format but with improved descriptions.
+        """
+        
+        try:
+            response = self.llm.invoke([HumanMessage(content=enhancement_prompt)])
+            response_text = self._extract_json_from_response(response.content)
+            enhanced_data = json.loads(response_text)
+            
+            # Update the original workflow data
+            enhanced_workflow = workflow_data.copy()
+            enhanced_workflow["steps"] = enhanced_data
+            enhanced_workflow["enhanced_at"] = datetime.now().isoformat()
+            enhanced_workflow["enhancement_context"] = additional_context
+            
+            return enhanced_workflow
+            
+        except Exception as e:
+            print(f"Error enhancing workflow: {e}")
+            return workflow_data
+
     def check_continuation_node(self, state: WorkflowState) -> WorkflowState:
-        """Node: Check if user wants to continue"""
-        print(f"\n📊 Current workflow progress:")
+        """Node: Check workflow status and handle phase transitions"""
+        # Check for stop signal
+        if workflow_control["stop_workflow"]:
+            print(f"\n🛑 Workflow stopped by user")
+            state["continue_workflow"] = False
+            state["analysis_complete"] = True
+            self.save_workflow_data(state["session_id"], state["steps"])
+            return state
+            
+        # Check for phase transition
+        if workflow_control["transition_to_enhancement"] and state["phase"] == "capture":
+            print(f"\n🔄 Transitioning to enhancement phase...")
+            state["phase"] = "enhancement"
+            state["continue_workflow"] = False  # Stop capture loop
+            state["analysis_complete"] = False   # Continue to enhancement
+            workflow_control["transition_to_enhancement"] = False  # Reset flag
+            self.save_workflow_data(state["session_id"], state["steps"])
+            return state
+        
+        # Display current progress
+        print(f"\n📊 Workflow Progress [{state['phase'].upper()} PHASE]:")
         print(f"Session ID: {state['session_id']}")
         print(f"Steps captured: {len(state['steps'])}")
         
@@ -484,18 +872,12 @@ class WorkflowAgent:
             print(f"  Action: {latest.action}")
             print(f"  Motivation: {latest.motivation}")
         
-        user_input = input("\nType 'end workflow' to finish, or press Enter to continue: ").strip().lower()
-        
-        if user_input == "end workflow":
-            state["continue_workflow"] = False
-            state["analysis_complete"] = True
-            # Save workflow data
-            self.save_workflow_data(state["session_id"], state["steps"])
+        print(f"⌨️  Press Ctrl+H to ask question, Ctrl+R for enhancement phase, Ctrl+Shift+Q to stop")
         
         return state
 
     def create_workflow_graph(self) -> StateGraph:
-        """Create the LangGraph workflow"""
+        """Create the unified LangGraph workflow with capture and enhancement phases"""
         workflow = StateGraph(WorkflowState)
         
         # Add nodes
@@ -503,12 +885,15 @@ class WorkflowAgent:
         workflow.add_node("analyze", self.analyze_workflow_node)
         workflow.add_node("human_input", self.human_input_node)
         workflow.add_node("check_continuation", self.check_continuation_node)
+        workflow.add_node("enhancement_analysis", self.enhancement_analysis_node)
+        workflow.add_node("enhancement_refinement", self.enhancement_refinement_node)
         
-        # Add edges
+        # Set entry point
         workflow.set_entry_point("capture")
+        
+        # Capture phase edges
         workflow.add_edge("capture", "analyze")
         
-        # Conditional edge from analyze
         workflow.add_conditional_edges(
             "analyze",
             lambda state: "human_input" if state["needs_human_input"] else "check_continuation",
@@ -517,20 +902,37 @@ class WorkflowAgent:
         
         workflow.add_edge("human_input", "check_continuation")
         
-        # Conditional edge from check_continuation
+        # Phase transition logic
         workflow.add_conditional_edges(
             "check_continuation",
-            lambda state: "end" if not state["continue_workflow"] else "capture",
-            {"capture": "capture", "end": END}
+            lambda state: (
+                END if workflow_control["stop_workflow"] or state["analysis_complete"] else
+                "enhancement_analysis" if state["phase"] == "enhancement" else
+                "capture"
+            ),
+            {
+                "capture": "capture", 
+                "enhancement_analysis": "enhancement_analysis",
+                END: END
+            }
         )
+        
+        # Enhancement phase edges
+        workflow.add_conditional_edges(
+            "enhancement_analysis",
+            lambda state: "enhancement_refinement" if state["needs_human_input"] else END,
+            {"enhancement_refinement": "enhancement_refinement", END: END}
+        )
+        
+        workflow.add_edge("enhancement_refinement", END)
         
         return workflow.compile()
 
     async def run_workflow(self):
-        """Main method to run the workflow"""
-        print("🚀 Starting LangGraph Workflow Agent")
-        print("This agent will capture screenshots every 10 seconds and analyze the workflow.")
-        print("Type 'end workflow' when prompted to finish.\n")
+        """Main method to run the unified workflow"""
+        print("🚀 Starting Unified LangGraph Workflow Agent")
+        print("This agent captures screenshots, analyzes workflow, and provides enhancement.")
+        print("Use Ctrl+R to transition phases, Ctrl+Shift+Q to stop.\n")
         
         # Create session
         session_id = self.create_session()
@@ -545,27 +947,46 @@ class WorkflowAgent:
             "analysis_complete": False,
             "needs_human_input": False,
             "human_question": "",
-            "continue_workflow": True
+            "continue_workflow": True,
+            "phase": "capture",
+            "enhancement_complete": False
         }
         
         # Create and run workflow
         workflow = self.create_workflow_graph()
         
         try:
-            final_state = await workflow.ainvoke(initial_state)
+            final_state = await workflow.ainvoke(
+                initial_state,
+                config={"recursion_limit": 50}
+            )
             
-            print(f"\n✅ Workflow completed!")
+            print(f"\n✅ Complete workflow finished!")
             print(f"📁 Session folder: {self.session_folder / session_id}")
             print(f"📊 Total steps captured: {len(final_state['steps'])}")
             print(f"📸 Screenshots captured: {len(final_state['screenshots'])}")
             
+            # Check for enhanced workflow
+            enhanced_file = self.session_folder / session_id / "workflow_enhanced.json"
+            if enhanced_file.exists():
+                print(f"✨ Enhanced workflow available: {enhanced_file}")
+            
             return final_state
             
         except KeyboardInterrupt:
-            print("\n⏹️  Workflow interrupted by user")
+            print("\n⏹️  Workflow interrupted by user (Ctrl+C)")
             self.save_workflow_data(session_id, initial_state["steps"])
             return initial_state
+        finally:
+            # Clean up keyboard listener
+            if self.keyboard_listener:
+                self.keyboard_listener.stop()
 
 if __name__ == "__main__":
-    agent = WorkflowAgent()
+    # You can configure human interaction level:
+    # "conservative" - Rarely asks questions (original behavior)
+    # "balanced" - Moderate interaction (default, improved)  
+    # "frequent" - More active questioning for thorough documentation
+    
+    agent = WorkflowAgent(human_interaction_level="balanced")
     asyncio.run(agent.run_workflow()) 
